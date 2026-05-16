@@ -1,0 +1,37 @@
+[
+  {
+    "objectID": "index.html",
+    "href": "index.html",
+    "title": "Movement Analysis II",
+    "section": "",
+    "text": "In the previous task, transportation mode was predicted using only movement parameters derived from the GPS trajectories themselves (speed, acceleration, sinuosity, turning angle). This task extends that approach by incorporating geographic context data from OpenStreetMap (OSM). The idea is that knowing what kind of road or railway a GPS point is near can help the model distinguish between modes that have similar movement signatures, such as bus and car.\nThe context data includes road type (highway), cycling infrastructure (cycleway), and railway type (railway). Several additional distance-based features are added on top of the examples shown in the getting started guide."
+  },
+  {
+    "objectID": "index.html#visualize-the-osm-context-data",
+    "href": "index.html#visualize-the-osm-context-data",
+    "title": "Movement Analysis II",
+    "section": "Visualize the OSM Context Data",
+    "text": "Visualize the OSM Context Data\n\nplot(highway[\"highway\"], main = \"Highway types – Beijing\")\n\n\n\n\n\n\n\n\n\nplot(railway[\"railway\"], main = \"Railway types – Beijing\")\n\n\n\n\n\n\n\n\nThe highway layer contains 43,376 road segments covering all major road types in Beijing, from motorways to residential streets. The railway layer contains 4,095 segments, clearly showing the Beijing subway network concentrated in the city centre and several overground rail lines extending outwards."
+  },
+  {
+    "objectID": "index.html#movement-features-from-the-previous-task",
+    "href": "index.html#movement-features-from-the-previous-task",
+    "title": "Movement Analysis II",
+    "section": "Movement Features (from the previous task)",
+    "text": "Movement Features (from the previous task)\nThe same movement features as in the previous task are computed: step length, time lag, speed, acceleration, sinuosity over a 5-point window, and turning angle.\n\nlibrary(zoo)\n\n# Speed and steplength\nfull_dataset &lt;- full_dataset |&gt;\n  mutate(\n    steplength = as.numeric(st_distance(lead(geom), geom, by_element = TRUE)),\n    timelag    = as.numeric(difftime(lead(datetime), datetime, units = \"secs\")),\n    speed      = steplength / timelag,\n    .by = track_id\n  )\n\n# Acceleration\nfull_dataset &lt;- full_dataset |&gt;\n  mutate(\n    acceleration = (lead(speed) - speed) / timelag,\n    .by = track_id\n  )\n\n# Sinuosity (5-point window)\nfull_dataset &lt;- full_dataset |&gt;\n  mutate(\n    straight_dist5 = as.numeric(st_distance(lead(geom, 5), geom, by_element = TRUE)),\n    full_dist5     = rollsum(steplength, 5, fill = NA, align = \"left\"),\n    sinuosity      = full_dist5 / straight_dist5,\n    .by = track_id\n  )\n\n# Turning angle\nfull_dataset &lt;- full_dataset |&gt;\n  mutate(\n    dx = as.numeric(lead(st_coordinates(geom)[, 1]) - st_coordinates(geom)[, 1]),\n    dy = as.numeric(lead(st_coordinates(geom)[, 2]) - st_coordinates(geom)[, 2]),\n    .by = track_id\n  ) |&gt;\n  mutate(\n    azi_next   = atan2(dy, dx),\n    azi_prev   = lag(azi_next),\n    turn_angle = atan2(sin(azi_next - azi_prev), cos(azi_next - azi_prev)),\n    .by = track_id\n  )"
+  },
+  {
+    "objectID": "index.html#context-features-new-this-task",
+    "href": "index.html#context-features-new-this-task",
+    "title": "Movement Analysis II",
+    "section": "Context Features (new this task)",
+    "text": "Context Features (new this task)\n\nHighway Type and Cycleway\nThe nearest highway segment is joined to each GPS point using st_nearest_feature. This gives the road type (highway) and whether the road has cycling infrastructure (cycleway).\n\nfull_dataset &lt;- st_join(full_dataset, highway |&gt; select(highway, cycleway),\n                        join = st_nearest_feature)\n\n\n\nDistance to Nearest Railway\n\nnearest_rail &lt;- st_nearest_feature(full_dataset, railway)\nfull_dataset$distance_to_railway &lt;- as.numeric(\n  st_distance(full_dataset, railway[nearest_rail, ], by_element = TRUE)\n)\n\n\n\nAdditional Features\nThree extra context features are added beyond the examples shown in the getting started guide.\n1. Railway type of the nearest line. Distinguishing subway from overground rail helps the model separate subway and train predictions, since they follow spatially distinct corridors in Beijing.\n\nfull_dataset$railway_type &lt;- railway$railway[nearest_rail]\n\n2. Near railway (binary). A point within 50 m of a railway line is likely on a train or subway. This binary threshold feature is easier for the model to use than a raw distance value.\n\nfull_dataset$near_railway &lt;- as.numeric(full_dataset$distance_to_railway &lt; 50)\n\n3. Distance to nearest motorway. Motorways are used only by cars and buses, not cyclists or pedestrians. Points very close to a motorway are very unlikely to be walking or cycling, which helps the model rule out those modes.\n\nmotorway &lt;- highway |&gt; filter(highway == \"motorway\")\n\nnearest_mw &lt;- st_nearest_feature(full_dataset, motorway)\nfull_dataset$distance_to_motorway &lt;- as.numeric(\n  st_distance(full_dataset, motorway[nearest_mw, ], by_element = TRUE)\n)"
+  },
+  {
+    "objectID": "index.html#references",
+    "href": "index.html#references",
+    "title": "Movement Analysis II",
+    "section": "References",
+    "text": "References\nZheng, Yu, Hao Fu, Xing Xie, Wei-Ying Ma, and Quannan Li. 2011. Geolife GPS Trajectory Dataset - User Guide. Geolife GPS trajectories 1.1. https://www.microsoft.com/en-us/research/publication/geolife-gps-trajectory-dataset-user-guide/\nOpenStreetMap contributors. 2024. OpenStreetMap data for Beijing, obtained via extract.bbbike.org."
+  }
+]
