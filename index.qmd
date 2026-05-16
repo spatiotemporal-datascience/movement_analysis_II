@@ -1,0 +1,373 @@
+---
+title: "Movement Analysis II"
+author: "Lejla Beganovic"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: false
+    embed-resources: true
+---
+
+# Introduction
+
+In the previous task, transportation mode was predicted using only movement parameters derived from the GPS trajectories themselves (speed, acceleration, sinuosity, turning angle). This task extends that approach by incorporating geographic context data from OpenStreetMap (OSM). The idea is that knowing what kind of road or railway a GPS point is near can help the model distinguish between modes that have similar movement signatures, such as bus and car.
+
+The context data includes road type (`highway`), cycling infrastructure (`cycleway`), and railway type (`railway`). Several additional distance-based features are added on top of the examples shown in the getting started guide.
+
+---
+
+# Step 1: Load the Data
+
+```{r}
+#| message: false
+#| warning: false
+
+library(sf)
+library(dplyr)
+
+# Paths
+pfad_I  <- "C:/Users/Lejlum/movement_analysis_I/Movement Analysis I-20260501"
+pfad_II <- "C:/Users/Lejlum/movement_analysis_II"
+
+# Load OSM context data
+highway <- read_sf(file.path(pfad_II, "osm.gpkg"), layer = "highway")
+railway <- read_sf(file.path(pfad_II, "osm.gpkg"), layer = "railway")
+
+# Load GPS movement data
+training_dataset <- read_sf(file.path(pfad_I, "tracks_1.gpkg"), layer = "training") |>
+  mutate(data = "training")
+testing_dataset  <- read_sf(file.path(pfad_I, "tracks_1.gpkg"), layer = "testing")  |>
+  mutate(data = "testing")
+validation_dataset <- read_sf(file.path(pfad_I, "tracks_1.gpkg"), layer = "validation") |>
+  mutate(data = "validation")
+
+full_dataset <- bind_rows(training_dataset, testing_dataset, validation_dataset)
+
+cat("GPS points:", nrow(full_dataset), "\n")
+cat("Highway segments:", nrow(highway), "\n")
+cat("Railway segments:", nrow(railway), "\n")
+```
+
+## Visualize the OSM Context Data
+
+```{r}
+#| message: false
+#| warning: false
+
+plot(highway["highway"], main = "Highway types – Beijing")
+```
+
+```{r}
+#| message: false
+#| warning: false
+
+plot(railway["railway"], main = "Railway types – Beijing")
+```
+
+The highway layer contains 43,376 road segments covering all major road types in Beijing, from motorways to residential streets. The railway layer contains 4,095 segments, clearly showing the Beijing subway network concentrated in the city centre and several overground rail lines extending outwards.
+
+---
+
+# Step 2: Feature Engineering
+
+## Movement Features (from the previous task)
+
+The same movement features as in the previous task are computed: step length, time lag, speed, acceleration, sinuosity over a 5-point window, and turning angle.
+
+```{r}
+#| message: false
+#| warning: false
+
+library(zoo)
+
+# Speed and steplength
+full_dataset <- full_dataset |>
+  mutate(
+    steplength = as.numeric(st_distance(lead(geom), geom, by_element = TRUE)),
+    timelag    = as.numeric(difftime(lead(datetime), datetime, units = "secs")),
+    speed      = steplength / timelag,
+    .by = track_id
+  )
+
+# Acceleration
+full_dataset <- full_dataset |>
+  mutate(
+    acceleration = (lead(speed) - speed) / timelag,
+    .by = track_id
+  )
+
+# Sinuosity (5-point window)
+full_dataset <- full_dataset |>
+  mutate(
+    straight_dist5 = as.numeric(st_distance(lead(geom, 5), geom, by_element = TRUE)),
+    full_dist5     = rollsum(steplength, 5, fill = NA, align = "left"),
+    sinuosity      = full_dist5 / straight_dist5,
+    .by = track_id
+  )
+
+# Turning angle
+full_dataset <- full_dataset |>
+  mutate(
+    dx = as.numeric(lead(st_coordinates(geom)[, 1]) - st_coordinates(geom)[, 1]),
+    dy = as.numeric(lead(st_coordinates(geom)[, 2]) - st_coordinates(geom)[, 2]),
+    .by = track_id
+  ) |>
+  mutate(
+    azi_next   = atan2(dy, dx),
+    azi_prev   = lag(azi_next),
+    turn_angle = atan2(sin(azi_next - azi_prev), cos(azi_next - azi_prev)),
+    .by = track_id
+  )
+```
+
+## Context Features (new this task)
+
+### Highway Type and Cycleway
+
+The nearest highway segment is joined to each GPS point using `st_nearest_feature`. This gives the road type (`highway`) and whether the road has cycling infrastructure (`cycleway`).
+
+```{r}
+#| message: false
+#| warning: false
+
+full_dataset <- st_join(full_dataset, highway |> select(highway, cycleway),
+                        join = st_nearest_feature)
+```
+
+### Distance to Nearest Railway
+
+```{r}
+#| message: false
+#| warning: false
+
+nearest_rail <- st_nearest_feature(full_dataset, railway)
+full_dataset$distance_to_railway <- as.numeric(
+  st_distance(full_dataset, railway[nearest_rail, ], by_element = TRUE)
+)
+```
+
+### Additional Features
+
+Three extra context features are added beyond the examples shown in the getting started guide.
+
+**1. Railway type of the nearest line.** Distinguishing subway from overground rail helps the model separate subway and train predictions, since they follow spatially distinct corridors in Beijing.
+
+```{r}
+#| message: false
+#| warning: false
+
+full_dataset$railway_type <- railway$railway[nearest_rail]
+```
+
+**2. Near railway (binary).** A point within 50 m of a railway line is likely on a train or subway. This binary threshold feature is easier for the model to use than a raw distance value.
+
+```{r}
+#| message: false
+#| warning: false
+
+full_dataset$near_railway <- as.numeric(full_dataset$distance_to_railway < 50)
+```
+
+**3. Distance to nearest motorway.** Motorways are used only by cars and buses, not cyclists or pedestrians. Points very close to a motorway are very unlikely to be walking or cycling, which helps the model rule out those modes.
+
+```{r}
+#| message: false
+#| warning: false
+
+motorway <- highway |> filter(highway == "motorway")
+
+nearest_mw <- st_nearest_feature(full_dataset, motorway)
+full_dataset$distance_to_motorway <- as.numeric(
+  st_distance(full_dataset, motorway[nearest_mw, ], by_element = TRUE)
+)
+```
+
+---
+
+# Step 3: Prepare Training Data
+
+All movement and context features are combined. The `highway` and `railway_type` columns are converted to factors. Rows with missing values at segment boundaries are removed.
+
+```{r}
+#| message: false
+#| warning: false
+
+feat_cols <- c("speed", "acceleration", "sinuosity", "turn_angle",
+               "highway", "cycleway", "distance_to_railway",
+               "railway_type", "near_railway", "distance_to_motorway")
+
+point_data <- full_dataset |>
+  st_drop_geometry() |>
+  select(data, mode, all_of(feat_cols)) |>
+  mutate(
+    highway      = factor(highway),
+    railway_type = factor(railway_type),
+    cycleway     = as.numeric(cycleway)
+  ) |>
+  filter(if_all(c("speed", "acceleration", "sinuosity", "turn_angle",
+                  "distance_to_railway", "near_railway",
+                  "distance_to_motorway"), ~ is.finite(.))) |>
+  filter(!is.na(highway), !is.na(railway_type))
+
+point_train <- point_data |>
+  filter(data == "training", !is.na(mode)) |>
+  select(-data) |>
+  mutate(mode = factor(mode))
+
+point_test <- point_data |>
+  filter(data == "testing", !is.na(mode)) |>
+  select(-data) |>
+  mutate(mode = factor(mode))
+
+cat("Training points:", nrow(point_train), "\n")
+cat("Testing points:", nrow(point_test), "\n")
+cat("Class distribution:\n")
+print(table(point_train$mode))
+```
+
+---
+
+# Step 4: Train the Model
+
+A Random Forest is trained on all movement and context features combined. The same downsampling approach as in the previous task is used to keep training time manageable.
+
+```{r}
+#| message: false
+#| warning: false
+
+library(ranger)
+
+set.seed(42)
+
+point_sample <- point_train |>
+  group_by(mode) |>
+  slice_sample(n = 8000, replace = TRUE) |>
+  ungroup()
+
+rf_context <- ranger(
+  formula = mode ~ speed + acceleration + sinuosity + turn_angle +
+                   highway + cycleway + distance_to_railway +
+                   railway_type + near_railway + distance_to_motorway,
+  data           = point_sample,
+  num.trees      = 300,
+  importance     = "impurity",
+  classification = TRUE,
+  seed           = 42
+)
+
+print(rf_context)
+```
+
+---
+
+# Step 5: Evaluate the Model
+
+```{r}
+#| message: false
+#| warning: false
+
+library(caret)
+
+pred_context <- predict(rf_context, data = point_test)$predictions
+
+pred_context    <- factor(pred_context,    levels = sort(levels(point_test$mode)))
+point_test$mode <- factor(point_test$mode, levels = sort(levels(point_test$mode)))
+
+confusionMatrix(pred_context, reference = point_test$mode)
+```
+
+The context-enriched model reaches an overall accuracy of **64.5%**, which is a clear improvement over the 50.5% achieved  in the previous task with movement features alone. The biggest gain is for subway, whose sensitivity jumped from 0.52 to 0.88. This makes sense: subway lines in Beijing follow fixed, spatially distinct corridors, so proximity to railway infrastructure is a very strong signal. Train also improved, from 0.41 to 0.62. Bike improved from 0.65 to 0.77. Bus and car remain the hardest pair to separate, with sensitivities of 0.54 and 0.55, because both modes use the same road types.
+
+---
+
+# Step 6: Feature Importance
+
+```{r}
+#| message: false
+#| warning: false
+#| fig-cap: "Figure 1: Variable importance from the Random Forest model with movement and context features."
+
+library(ggplot2)
+
+importance_df <- data.frame(
+  feature    = names(rf_context$variable.importance),
+  importance = rf_context$variable.importance
+) |>
+  arrange(desc(importance))
+
+ggplot(importance_df, aes(x = reorder(feature, importance), y = importance)) +
+  geom_col(fill = "#2166ac") +
+  coord_flip() +
+  labs(
+    title   = "Random Forest variable importance (movement + context)",
+    x       = NULL,
+    y       = "Mean decrease in node impurity",
+    caption = "Data: GeoLife (Zheng et al. 2011) | OSM context data"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+Figure 1 shows that `speed` remains the most important feature by a large margin. Among the context features, `distance_to_motorway` is the second most important feature overall, ranking above `distance_to_railway` in third place. This is somewhat surprising: the distance to a motorway turns out to be more discriminating than the distance to a railway. A possible explanation is that motorways in Beijing are well defined spatially and strongly restrict which modes can be nearby, while railway distances vary more gradually. `sinuosity`
+ranks fourth, followed by `railway_type`. Further down, `acceleration`, `turn_angle`, and `highway` type contribute roughly equally. `near_railway` adds a smaller secondary signal, and `cycleway` has near-zero importance, reflecting that dedicated cycling infrastructure is rare in the dataset.
+
+---
+
+# Step 7: Predict the Validation Dataset
+
+```{r}
+#| message: false
+#| warning: false
+
+point_val <- point_data |>
+  filter(data == "validation") |>
+  select(-data, -mode)
+
+val_pred <- predict(rf_context, data = point_val)$predictions
+
+cat("Predicted class distribution in validation set:\n")
+print(table(val_pred))
+```
+
+The predicted distribution in the validation set shows walk (53,696) and bus (42,504) as the most frequently predicted modes, followed by bike (44,739), car (24,860), subway (13,679), and train (1,011). The low train count reflects the rarity of overground rail trips in the dataset, consistent with the training class distribution.
+
+---
+
+# Step 8: Comparison with Movement Analysis I
+
+The context-enriched model improves overall accuracy from **50.5% (Movement Analysis I) to 64.5% (Movement Analysis II)**.
+
+The most striking improvement is for subway, which went from a sensitivity of 0.52 to 0.88. This confirms that subway and train are the modes that benefit most from geographic context: their trajectories are physically constrained to railway corridors, so knowing the distance and type of the nearest railway line directly encodes information about whether a point is on a rail service. Bike also improved noticeably (0.65 to 0.77), partly because motorway distance rules out cycling near major roads.
+
+Bus and car improved more modestly (bus: 0.37 to 0.54, car: 0.30 to 0.55). Both modes share the same road network, so road type alone cannot separate them. Their remaining confusion confirms that distinguishing bus from car requires either finer spatial context (for example, bus stop locations) or a longer temporal window to capture stop-and-go patterns.
+
+---
+
+# Discussion
+
+Adding OSM context features improves transport mode detection substantially compared to using movement parameters alone. The most informative new features are `distance_to_motorway` and `distance_to_railway`, both of which encode where a GPS point is in relation to major infrastructure. This aligns with the idea of Context-Aware Movement Analysis (CAMA) from the lecture: pure movement parameters capture how someone moves, but context data encodes where they are moving, and together these two sources of information provide a more complete picture of transport behaviour.
+
+The near-zero importance of `cycleway` shows that cycling infrastructure in the OSM data for Beijing is too sparse to be useful. Similarly, `near_railway` adds little on top of the continuous `distance_to_railway`, since the binary threshold does not provide much additional discrimination beyond the raw distance.
+
+Remaining limitations include the nearest-feature assignment approach, which assigns a single road type to each GPS point even when it is equidistant from two different road types. A buffer-based approach, computing the proportion of different road types within a radius around each point, could capture the spatial context more robustly. Adding temporal context such as time of day could further improve predictions, since bus and subway schedules create predictable temporal patterns in speed that a purely spatial model cannot
+exploit.
+
+## References
+
+Zheng, Yu, Hao Fu, Xing Xie, Wei-Ying Ma, and Quannan Li. 2011. *Geolife GPS Trajectory
+Dataset - User Guide*. Geolife GPS trajectories 1.1.
+<https://www.microsoft.com/en-us/research/publication/geolife-gps-trajectory-dataset-user-guide/>
+
+OpenStreetMap contributors. 2024. OpenStreetMap data for Beijing, obtained via
+extract.bbbike.org.
+
+---
+
+# Declaration of AI Use
+
+In accordance with the ZHAW Z-RL-Guidelines on AI in assessments (01.04.2023), I declare that I used Claude (Anthropic) as an AI assistant during this assignment.
+
+Claude supported me with debugging errors, correcting text phrasing, and structuring the context feature engineering and classification workflow in this task.
+
+All decisions about structure, approach, and content were made by me. I understood each correction before applying it, and Claude served as a troubleshooting and learning aid rather than a replacement for my own work.
